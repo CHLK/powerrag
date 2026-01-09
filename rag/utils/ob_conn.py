@@ -35,14 +35,13 @@ from sqlalchemy import text, Column, String, Integer, JSON, Double, Row, Table
 from sqlalchemy.dialects.mysql import LONGTEXT, TEXT
 from sqlalchemy.sql.type_api import TypeEngine
 
-from api.utils.configs import get_base_config
 from common import settings
 from common.constants import PAGERANK_FLD, TAG_FLD
 from common.decorator import singleton
 from common.float_utils import get_float
-from rag.nlp import rag_tokenizer
-from rag.utils.doc_store_conn import DocStoreConnection, MatchExpr, OrderByExpr, FusionExpr, MatchTextExpr, \
+from common.doc_store.doc_store_base import DocStoreConnection, MatchExpr, OrderByExpr, FusionExpr, MatchTextExpr, \
     MatchDenseExpr
+from rag.nlp import rag_tokenizer
 
 ATTEMPT_TIME = 2
 OB_QUERY_TIMEOUT = int(os.environ.get("OB_QUERY_TIMEOUT", "100_000_000"))
@@ -82,6 +81,7 @@ def run_functions_tuples_in_parallel(
 
 column_order_id = Column("_order_id", Integer, nullable=True, comment="chunk order id for maintaining sequence")
 column_group_id = Column("group_id", String(256), nullable=True, comment="group id for external retrieval")
+column_mom_id = Column("mom_id", String(256), nullable=True, comment="parent chunk id")
 
 column_definitions: list[Column] = [
     Column("id", String(256), primary_key=True, comment="chunk id"),
@@ -126,6 +126,7 @@ column_definitions: list[Column] = [
     Column("extra", JSON, nullable=True, comment="extra information of non-general chunk"),
     column_order_id,
     column_group_id,
+    column_mom_id,
 ]
 
 column_names: list[str] = [col.name for col in column_definitions]
@@ -380,7 +381,7 @@ class OBConnection(DocStoreConnection):
         ob_config = settings.OB.get("config", {})
 
         if scheme and scheme.lower() == "mysql":
-            mysql_config = get_base_config("mysql", {})
+            mysql_config = settings.get_base_config("mysql", {})
             logger.info("Use MySQL scheme to create OceanBase connection.")
             host = mysql_config.get("host", "localhost")
             port = mysql_config.get("port", 2881)
@@ -513,8 +514,14 @@ class OBConnection(DocStoreConnection):
             return os.getenv(var, default).lower() in ['true', '1', 'yes', 'y']
 
         self.enable_fulltext_search = is_true('ENABLE_FULLTEXT_SEARCH', 'true')
+        logger.info(f"ENABLE_FULLTEXT_SEARCH={self.enable_fulltext_search}")
+
         self.use_fulltext_hint = is_true('USE_FULLTEXT_HINT', 'true')
+        logger.info(f"USE_FULLTEXT_HINT={self.use_fulltext_hint}")
+
         self.search_original_content = is_true("SEARCH_ORIGINAL_CONTENT", 'true')
+        logger.info(f"SEARCH_ORIGINAL_CONTENT={self.search_original_content}")
+
         self.enable_hybrid_search = is_true('ENABLE_HYBRID_SEARCH', 'false')
         self.use_fulltext_first_fusion_search = is_true('USE_FULLTEXT_FIRST_FUSION_SEARCH', 'true')
         logger.info(f"USE_FULLTEXT_FIRST_FUSION_SEARCH={self.use_fulltext_first_fusion_search}")
@@ -523,7 +530,7 @@ class OBConnection(DocStoreConnection):
     Database operations
     """
 
-    def dbType(self) -> str:
+    def db_type(self) -> str:
         return "oceanbase"
 
     def health(self) -> dict:
@@ -564,7 +571,7 @@ class OBConnection(DocStoreConnection):
                 column_name = fts_column.split("^")[0]
                 if not self._index_exists(table_name, fulltext_index_name_template % column_name):
                     return False
-            for column in [column_order_id, column_group_id]:
+            for column in [column_order_id, column_group_id, column_mom_id]:
                 if not self._column_exist(table_name, column.name):
                     return False
         except Exception as e:
@@ -579,7 +586,7 @@ class OBConnection(DocStoreConnection):
     Table operations
     """
 
-    def createIdx(self, indexName: str, knowledgebaseId: str, vectorSize: int):
+    def create_idx(self, indexName: str, knowledgebaseId: str, vectorSize: int):
         vector_field_name = f"q_{vectorSize}_vec"
         vector_index_name = f"{vector_field_name}_idx"
 
@@ -618,7 +625,7 @@ class OBConnection(DocStoreConnection):
             )
 
             # new columns migration
-            for column in [column_order_id, column_group_id]:
+            for column in [column_order_id, column_group_id, column_mom_id]:
                 _try_with_lock(
                     lock_name=f"ob_add_{column.name}_{indexName}",
                     check_func=lambda: self._column_exist(indexName, column.name),
@@ -630,7 +637,7 @@ class OBConnection(DocStoreConnection):
             # always refresh metadata to make sure it contains the latest table structure
             self.client.refresh_metadata([indexName])
 
-    def deleteIdx(self, indexName: str, knowledgebaseId: str):
+    def delete_idx(self, indexName: str, knowledgebaseId: str):
         if len(knowledgebaseId) > 0:
             # The index need to be alive after any kb deletion since all kb under this tenant are in one index.
             return
@@ -641,7 +648,7 @@ class OBConnection(DocStoreConnection):
         except Exception as e:
             raise Exception(f"OBConnection.deleteIndex error: {str(e)}")
 
-    def indexExist(self, indexName: str, knowledgebaseId: str = None) -> bool:
+    def index_exist(self, indexName: str, knowledgebaseId: str = None) -> bool:
         return self._check_table_exists_cached(indexName)
 
     def _get_count(self, table_name: str, filter_list: list[str] = None) -> int:
@@ -979,20 +986,23 @@ class OBConnection(DocStoreConnection):
         return paged, total_count
 
     def search(
-        self,
-        selectFields: list[str],
-        highlightFields: list[str],
-        condition: dict,
-        matchExprs: list[MatchExpr],
-        orderBy: OrderByExpr,
-        offset: int,
-        limit: int,
-        indexNames: str | list[str],
-        knowledgebaseIds: list[str],
-        aggFields: list[str] = [],
-        rank_feature: dict | None = None,
-        **kwargs,
+            self,
+            selectFields: list[str],
+            highlightFields: list[str],
+            condition: dict,
+            matchExprs: list[MatchExpr],
+            orderBy: OrderByExpr,
+            offset: int,
+            limit: int,
+            indexNames: str | list[str],
+            knowledgebaseIds: list[str],
+            aggFields: list[str] = [],
+            rank_feature: dict | None = None,
+            **kwargs,
     ):
+        # Extract group_results from kwargs
+        group_results = kwargs.get("group_results", False)
+        
         if isinstance(indexNames, str):
             indexNames = indexNames.split(",")
         assert isinstance(indexNames, list) and len(indexNames) > 0
@@ -1221,7 +1231,11 @@ class OBConnection(DocStoreConnection):
         if search_type in ["fusion", "fulltext", "vector"] and "_score" not in output_fields:
             output_fields.append("_score")
 
-        group_results = kwargs.get("group_results", False)
+        if limit:
+            if vector_topn is not None:
+                limit = min(vector_topn, limit)
+            if fulltext_topn is not None:
+                limit = min(fulltext_topn, limit)
 
         for index_name in indexNames:
 
@@ -1574,6 +1588,10 @@ class OBConnection(DocStoreConnection):
 
                 for row in rows:
                     result.chunks.append(self._row_to_entity(row, output_fields))
+
+        if result.total == 0:
+            result.total = len(result.chunks)
+
         return result
 
     def get(self, chunkId: str, indexName: str, knowledgebaseIds: list[str]) -> dict | None:
@@ -1768,7 +1786,7 @@ class OBConnection(DocStoreConnection):
     def get_total(self, res) -> int:
         return res.total
 
-    def get_chunk_ids(self, res) -> list[str]:
+    def get_doc_ids(self, res) -> list[str]:
         return [row["id"] for row in res.chunks]
 
     def get_fields(self, res, fields: list[str]) -> dict[str, dict]:
@@ -1815,7 +1833,7 @@ class OBConnection(DocStoreConnection):
                     flags=re.IGNORECASE | re.MULTILINE,
                 )
             if len(re.findall(r'</em><em>', highlighted_txt)) > 0 or len(
-                re.findall(r'</em>\s*<em>', highlighted_txt)) > 0:
+                    re.findall(r'</em>\s*<em>', highlighted_txt)) > 0:
                 return highlighted_txt
             else:
                 return None
@@ -1834,9 +1852,9 @@ class OBConnection(DocStoreConnection):
             if token_pos != -1:
                 if token in keywords:
                     highlighted_txt = (
-                        highlighted_txt[:token_pos] +
-                        f'<em>{token}</em>' +
-                        highlighted_txt[token_pos + len(token):]
+                            highlighted_txt[:token_pos] +
+                            f'<em>{token}</em>' +
+                            highlighted_txt[token_pos + len(token):]
                     )
                 last_pos = token_pos
         return re.sub(r'</em><em>', '', highlighted_txt)
@@ -1887,6 +1905,6 @@ class OBConnection(DocStoreConnection):
     SQL
     """
 
-    def sql(sql: str, fetch_size: int, format: str):
+    def sql(self, sql: str, fetch_size: int, format: str):
         # TODO: execute the sql generated by text-to-sql
         return None
